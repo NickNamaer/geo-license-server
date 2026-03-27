@@ -29,13 +29,21 @@ app = FastAPI(title=APP_NAME)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-            "http://172.25.0.1:5173",
-        ],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://192.168.1.12:5173",
+        "http://192.168.1.12:5174",
+        "http://172.20.240.1:5173",
+        "http://172.20.240.1:5174",
+        "https://geotivity.jp",
+        "https://www.geotivity.jp",
+        "https://admin.geotivity.jp",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/api/admin/licenses")
