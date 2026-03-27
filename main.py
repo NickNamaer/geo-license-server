@@ -809,18 +809,26 @@ def upsert_trial_license(license_key: str, machine_id: str) -> sqlite3.Row:
     return row
 
 
+def normalize_machine_id(machine_id: str) -> str:
+    return str(machine_id or "").strip()
+
+
 def get_trial_by_machine_id(machine_id: str) -> Optional[sqlite3.Row]:
+    normalized_machine_id = normalize_machine_id(machine_id)
+    if not normalized_machine_id:
+        return None
+
     with db_connect() as conn:
         row = conn.execute(
             """
             SELECT *
             FROM licenses
             WHERE license_type = 'trial'
-              AND machine_id = ?
+              AND TRIM(COALESCE(machine_id, '')) = ?
             ORDER BY id DESC
             LIMIT 1
             """,
-            (machine_id,)
+            (normalized_machine_id,),
         ).fetchone()
     return row
 
@@ -838,9 +846,11 @@ def create_machine_trial_license(
     product_name: str = "",
     plugin_version: str = "",
 ) -> sqlite3.Row:
+    normalized_machine_id = normalize_machine_id(machine_id)
+    if not normalized_machine_id:
+        raise HTTPException(status_code=400, detail="machine_id is required")
+
     now = today_utc_str()
-    license_key = generate_trial_license_key()
-    expires_at = add_days_str(now, TRIAL_DAYS)
 
     note_parts = ["plugin auto-issued trial"]
     if product_name.strip():
@@ -850,6 +860,24 @@ def create_machine_trial_license(
     note = " | ".join(note_parts)
 
     with db_connect() as conn:
+        existing_row = conn.execute(
+            """
+            SELECT *
+            FROM licenses
+            WHERE license_type = 'trial'
+              AND TRIM(COALESCE(machine_id, '')) = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (normalized_machine_id,),
+        ).fetchone()
+
+        if existing_row is not None:
+            return existing_row
+
+        license_key = generate_trial_license_key()
+        expires_at = add_days_str(now, TRIAL_DAYS)
+
         conn.execute(
             """
             INSERT INTO licenses (
@@ -867,7 +895,7 @@ def create_machine_trial_license(
                 now,
                 expires_at,
                 TRIAL_AREA_LIMIT_HA,
-                machine_id,
+                normalized_machine_id,
                 note,
                 now,
                 now,
@@ -1137,7 +1165,7 @@ def health():
 
 @app.post("/api/license/issue-trial")
 def issue_trial(req: IssueTrialRequest):
-    machine_id = req.machine_id.strip()
+    machine_id = normalize_machine_id(req.machine_id)
     product_name = (req.product_name or PRODUCT_NAME).strip() or PRODUCT_NAME
     plugin_version = (req.plugin_version or "").strip()
 
@@ -1211,7 +1239,7 @@ def verify_license(req: VerifyRequest, request: Request):
         }
 
     license_key = req.license_key.strip()
-    machine_id = req.machine_id.strip()
+    machine_id = normalize_machine_id(req.machine_id)
 
     if not license_key:
         log_verification(
