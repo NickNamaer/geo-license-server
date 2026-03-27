@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -22,6 +22,9 @@ SECRET = os.environ.get("GEOTIVITY_SECRET", "CHANGE_THIS_SECRET")
 TRIAL_DAYS = int(os.environ.get("GEOTIVITY_TRIAL_DAYS", "30"))
 TRIAL_AREA_LIMIT_HA = float(os.environ.get("GEOTIVITY_TRIAL_AREA_LIMIT_HA", "5.0"))
 ADMIN_TOKEN = os.environ.get("GEOTIVITY_ADMIN_TOKEN", "CHANGE_THIS_ADMIN_TOKEN")
+SESSION_SECRET = os.environ.get("GEOTIVITY_SESSION_SECRET", "CHANGE_THIS_SESSION_SECRET")
+SESSION_COOKIE_NAME = os.environ.get("GEOTIVITY_SESSION_COOKIE_NAME", "geotivity_admin_session")
+SESSION_TTL_HOURS = int(os.environ.get("GEOTIVITY_SESSION_TTL_HOURS", "12"))
 PRODUCT_NAME = "GeoTivity"
 
 app = FastAPI(title=APP_NAME)
@@ -47,8 +50,11 @@ app.add_middleware(
 )
 
 @app.get("/api/admin/licenses")
-def get_admin_licenses(x_admin_token: Optional[str] = Header(default=None)):
-    require_admin_token(x_admin_token)
+def get_admin_licenses(
+    request: Request,
+    x_admin_token: Optional[str] = Header(default=None),
+):
+    require_admin_access(request, x_admin_token)
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -983,6 +989,82 @@ def issue_full_license(
         )
         conn.commit()
 
+def hash_password_sha256(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _session_sign(payload: str) -> str:
+    return hmac.new(
+        SESSION_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def build_admin_session_value(username: str, expires_at: str) -> str:
+    payload = f"{username}|{expires_at}"
+    sig = _session_sign(payload)
+    return f"{payload}|{sig}"
+
+
+def parse_admin_session_value(session_value: str) -> Optional[dict]:
+    try:
+        username, expires_at, sig = session_value.split("|", 2)
+    except Exception:
+        return None
+
+    payload = f"{username}|{expires_at}"
+    expected = _session_sign(payload)
+
+    if not hmac.compare_digest(sig, expected):
+        return None
+
+    try:
+        expires_dt = datetime.fromisoformat(expires_at)
+    except Exception:
+        return None
+
+    if datetime.utcnow() > expires_dt:
+        return None
+
+    return {
+        "username": username,
+        "expires_at": expires_at,
+    }
+
+
+def get_admin_user_by_username(conn: sqlite3.Connection, username: str):
+    return conn.execute(
+        """
+        SELECT id, username, password_hash, display_name, role, is_active
+        FROM admin_users
+        WHERE username = ?
+        """,
+        (username,),
+    ).fetchone()
+
+
+def get_admin_username_from_request(request: Request) -> Optional[str]:
+    session_value = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_value:
+        return None
+
+    parsed = parse_admin_session_value(session_value)
+    if not parsed:
+        return None
+
+    return str(parsed["username"])
+
+
+def require_admin_access(request: Request, x_admin_token: Optional[str]) -> str:
+    username = get_admin_username_from_request(request)
+    if username:
+        return username
+
+    if x_admin_token and hmac.compare_digest(x_admin_token, ADMIN_TOKEN):
+        return "token_admin"
+
+    raise HTTPException(status_code=403, detail="admin auth required")
 
 def require_admin_token(x_admin_token: Optional[str]) -> None:
     if not x_admin_token or not hmac.compare_digest(x_admin_token, ADMIN_TOKEN):
@@ -1134,6 +1216,16 @@ class VerifyRequest(BaseModel):
     version: str
     client_time: Optional[str] = None
 
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class AdminMeResponse(BaseModel):
+    username: str
+    display_name: str
+    role: str
+
 
 class IssueFullRequest(BaseModel):
     license_key: str
@@ -1169,6 +1261,77 @@ def health():
         "service": APP_NAME,
         "time": datetime.utcnow().isoformat() + "Z",
     }
+
+@app.post("/api/admin/login")
+def admin_login(payload: AdminLoginRequest, response: Response):
+    username = str(payload.username or "").strip()
+    password = str(payload.password or "")
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password are required")
+
+    with db_connect() as conn:
+        user = get_admin_user_by_username(conn, username)
+        if user is None:
+            raise HTTPException(status_code=401, detail="invalid credentials")
+
+        if int(user["is_active"] or 0) != 1:
+            raise HTTPException(status_code=403, detail="admin user is inactive")
+
+        password_hash = hash_password_sha256(password)
+        if not hmac.compare_digest(password_hash, str(user["password_hash"] or "")):
+            raise HTTPException(status_code=401, detail="invalid credentials")
+
+        expires_dt = datetime.utcnow() + timedelta(hours=SESSION_TTL_HOURS)
+        expires_at = expires_dt.isoformat()
+        session_value = build_admin_session_value(username, expires_at)
+
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=session_value,
+            httponly=True,
+            secure=True,
+            samesite="none",
+            max_age=SESSION_TTL_HOURS * 3600,
+            path="/",
+        )
+
+        return {
+            "ok": True,
+            "username": username,
+            "display_name": str(user["display_name"] or ""),
+            "role": str(user["role"] or "admin"),
+            "expires_at": expires_at,
+        }
+
+
+@app.post("/api/admin/logout")
+def admin_logout(response: Response):
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path="/",
+        samesite="none",
+        secure=True,
+    )
+    return {"ok": True}
+
+
+@app.get("/api/admin/me", response_model=AdminMeResponse)
+def admin_me(request: Request):
+    username = get_admin_username_from_request(request)
+    if not username:
+        raise HTTPException(status_code=401, detail="not logged in")
+
+    with db_connect() as conn:
+        user = get_admin_user_by_username(conn, username)
+        if user is None or int(user["is_active"] or 0) != 1:
+            raise HTTPException(status_code=401, detail="not logged in")
+
+        return {
+            "username": str(user["username"]),
+            "display_name": str(user["display_name"] or ""),
+            "role": str(user["role"] or "admin"),
+        }
 
 
 @app.post("/api/license/issue-trial")
@@ -1557,10 +1720,11 @@ def verify_license(req: VerifyRequest, request: Request):
 # =========================
 
 @app.get("/api/admin/machines")
-def api_get_machines(
+def get_admin_licenses(
+    request: Request,
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    require_admin_token(x_admin_token)
+    require_admin_access(request, x_admin_token)
 
     with db_connect() as conn:
         rows = conn.execute(
@@ -1575,7 +1739,7 @@ def api_get_machines(
                 m.created_at
             FROM machines m
             LEFT JOIN licenses l
-              ON l.id = m.license_id
+            ON l.id = m.license_id
             ORDER BY m.id DESC
             """
         ).fetchall()
@@ -1598,9 +1762,10 @@ def api_get_machines(
 
 @app.get("/api/admin/admin_audit_logs")
 def api_get_admin_audit_logs(
+    request: Request,
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    require_admin_token(x_admin_token)
+    require_admin_access(request, x_admin_token)
 
     with db_connect() as conn:
         rows = conn.execute(
@@ -1636,9 +1801,10 @@ def api_get_admin_audit_logs(
 @app.post("/api/admin/issue_full")
 def api_issue_full(
     req: IssueFullRequest,
+    request: Request,
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    require_admin_token(x_admin_token)
+    require_admin_access(request, x_admin_token)
 
     license_key = req.license_key.strip()
     expires_at = req.expires_at.strip()
@@ -1688,9 +1854,10 @@ def api_issue_full(
 @app.post("/api/admin/deactivate")
 def api_deactivate(
     req: DeactivateRequest,
+    request: Request,
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    require_admin_token(x_admin_token)
+    require_admin_access(request, x_admin_token)
 
     now = today_utc_str()
     with db_connect() as conn:
@@ -1725,10 +1892,10 @@ def api_deactivate(
 @app.post("/api/admin/release_machine")
 def api_release_machine(
     req: ReleaseMachineRequest,
+    request: Request,
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    require_admin_token(x_admin_token)
-
+    require_admin_access(request, x_admin_token)
     result = release_machine_binding(
         license_key=req.license_key.strip(),
         machine_id=req.machine_id.strip(),
@@ -1750,9 +1917,10 @@ def api_release_machine(
 @app.get("/api/admin/license/{license_key}")
 def api_get_license(
     license_key: str,
+    request: Request,
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    require_admin_token(x_admin_token)
+    require_admin_access(request, x_admin_token)
 
     row = get_license_by_key(license_key.strip())
     if row is None:
@@ -1766,9 +1934,10 @@ def api_get_license(
 
 @app.post("/api/admin/create_trial")
 def api_create_trial(
+    request: Request,
     x_admin_token: Optional[str] = Header(default=None),
 ):
-    require_admin_token(x_admin_token)
+    require_admin_access(request, x_admin_token)
 
     trial_key = "TRIAL"
     now = today_utc_str()
