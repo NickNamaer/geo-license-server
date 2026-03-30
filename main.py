@@ -43,6 +43,7 @@ app.add_middleware(
         "https://geotivity.jp",
         "https://www.geotivity.jp",
         "https://admin.geotivity.jp",
+        "https://geotivity-license-admin.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -1290,8 +1291,8 @@ def admin_login(payload: AdminLoginRequest, response: Response):
             key=SESSION_COOKIE_NAME,
             value=session_value,
             httponly=True,
-            secure=True,
-            samesite="none",
+            secure=False,
+            samesite="lax",
             max_age=SESSION_TTL_HOURS * 3600,
             path="/",
         )
