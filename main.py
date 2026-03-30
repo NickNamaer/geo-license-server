@@ -1291,8 +1291,8 @@ def admin_login(payload: AdminLoginRequest, response: Response):
             key=SESSION_COOKIE_NAME,
             value=session_value,
             httponly=True,
-            secure=False,
-            samesite="lax",
+            secure=True,
+            samesite="none",
             max_age=SESSION_TTL_HOURS * 3600,
             path="/",
         )
