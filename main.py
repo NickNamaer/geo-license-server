@@ -17,7 +17,14 @@ from pydantic import BaseModel
 load_dotenv()
 
 APP_NAME = "GeoTivity License Server"
-DB_PATH = os.environ.get("GEOTIVITY_DB_PATH", "./data/licenses.db")
+from pathlib import Path
+
+DEFAULT_DB_PATH = "data/licenses.db"
+
+DB_PATH = os.environ.get("GEOTIVITY_DB_PATH", DEFAULT_DB_PATH)
+DB_PATH = str(Path(DB_PATH))
+
+print(f"[startup] DB_PATH = {DB_PATH}")
 SECRET = os.environ.get("GEOTIVITY_SECRET", "CHANGE_THIS_SECRET")
 TRIAL_DAYS = int(os.environ.get("GEOTIVITY_TRIAL_DAYS", "30"))
 TRIAL_AREA_LIMIT_HA = float(os.environ.get("GEOTIVITY_TRIAL_AREA_LIMIT_HA", "5.0"))
@@ -105,7 +112,10 @@ def db_connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    db_dir = Path(DB_PATH).parent
+    db_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[startup] DB_DIR = {db_dir}")
 
     with db_connect() as conn:
         conn.execute(
@@ -1410,8 +1420,15 @@ def verify_license(req: VerifyRequest, request: Request):
             "message": "Invalid product.",
         }
 
-    license_key = req.license_key.strip()
-    machine_id = normalize_machine_id(req.machine_id)
+    license_key = str(req.license_key or "").strip()
+    expires_at = str(req.expires_at or "").strip()
+    note = str(req.note or "")
+
+    if not license_key:
+        raise HTTPException(status_code=400, detail="license_key is required")
+
+    if not expires_at:
+        raise HTTPException(status_code=400, detail="expires_at is required")
 
     if not license_key:
         log_verification(
@@ -1807,8 +1824,9 @@ def api_issue_full(
 ):
     require_admin_access(request, x_admin_token)
 
-    license_key = req.license_key.strip()
-    expires_at = req.expires_at.strip()
+    license_key = str(req.license_key or "").strip()
+    expires_at = str(req.expires_at or "").strip()
+    note = str(req.note or "")
 
     if not license_key:
         raise HTTPException(status_code=400, detail="license_key is required")
@@ -1824,9 +1842,9 @@ def api_issue_full(
     issue_full_license(
         license_key=license_key,
         expires_at=expires_at,
-        area_limit_ha=float(req.area_limit_ha),
-        note=req.note,
-        max_machines=int(req.max_machines),
+        area_limit_ha=float(req.area_limit_ha or 0),
+        note=note,
+        max_machines=int(req.max_machines or 1),
     )
 
     with db_connect() as conn:
