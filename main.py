@@ -5,6 +5,8 @@ import uuid
 import sqlite3
 import hashlib
 import secrets
+import logging
+import traceback
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
@@ -15,6 +17,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 load_dotenv()
+
+# ---------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------
+logger = logging.getLogger("geotivity.license")
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(
+        logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s")
+    )
+    logger.addHandler(_h)
+logger.setLevel(logging.INFO)
 
 APP_NAME = "GeoTivity License Server"
 from pathlib import Path
@@ -1395,239 +1409,350 @@ def issue_trial(req: IssueTrialRequest):
 
 @app.post("/api/license/verify")
 def verify_license(req: VerifyRequest, request: Request):
-    now = today_utc_str()
+    """
+    License verification endpoint.
+
+    修正点:
+    - `req.expires_at` / `req.note` は VerifyRequest に存在しないので参照しない。
+      expires_at 等のライセンス状態値は DB レコードから取得する。
+    - expires_at が NULL/空なら「期限なし (perpetual)」として扱い、
+      期限切れ判定をスキップする。
+    - area_limit_ha が NULL でも 0.0 にフォールバックして落ちないようにする。
+    - 例外時は HTTP 500 を直接返さず、traceback をログに残した上で
+      JSON エラー (INTERNAL_ERROR) を返す。
+    """
+
     remote_addr = get_client_ip(request)
-    conn = db_connect()
 
-    if req.product != "GeoTivity":
-        log_verification(
-            conn,
-            license_id=None,
-            license_key=req.license_key,
-            machine_id=req.machine_id,
-            product=req.product,
-            version=req.version,
-            client_time=req.client_time,
-            success=False,
-            error_code="INVALID_PRODUCT",
-            message="Invalid product.",
-            remote_addr=remote_addr,
-        )
-        conn.commit()
-        return {
-            "ok": False,
-            "error_code": "INVALID_PRODUCT",
-            "message": "Invalid product.",
-        }
+    # Pydantic のフィールドのみを使って入力値を正規化
+    raw_license_key = str(getattr(req, "license_key", "") or "")
+    raw_machine_id = str(getattr(req, "machine_id", "") or "")
+    raw_product = str(getattr(req, "product", "") or "")
+    raw_version = str(getattr(req, "version", "") or "")
+    raw_client_time = getattr(req, "client_time", None)
 
-    license_key = str(req.license_key or "").strip()
-    expires_at = str(req.expires_at or "").strip()
-    note = str(req.note or "")
+    conn = None
+    try:
+        now = today_utc_str()
+        conn = db_connect()
 
-    if not license_key:
-        raise HTTPException(status_code=400, detail="license_key is required")
-
-    if not expires_at:
-        raise HTTPException(status_code=400, detail="expires_at is required")
-
-    if not license_key:
-        log_verification(
-            conn,
-            license_id=None,
-            license_key=req.license_key,
-            machine_id=req.machine_id,
-            product=req.product,
-            version=req.version,
-            client_time=req.client_time,
-            success=False,
-            error_code="EMPTY_LICENSE_KEY",
-            message="License key is empty.",
-            remote_addr=remote_addr,
-        )
-        conn.commit()
-        return {
-            "ok": False,
-            "error_code": "EMPTY_LICENSE_KEY",
-            "message": "License key is empty.",
-        }
-
-    if not machine_id:
-        log_verification(
-            conn,
-            license_id=None,
-            license_key=license_key,
-            machine_id=req.machine_id,
-            product=req.product,
-            version=req.version,
-            client_time=req.client_time,
-            success=False,
-            error_code="EMPTY_MACHINE_ID",
-            message="Machine ID is empty.",
-            remote_addr=remote_addr,
-        )
-        conn.commit()
-        return {
-            "ok": False,
-            "error_code": "EMPTY_MACHINE_ID",
-            "message": "Machine ID is empty.",
-        }
-
-    if license_key.upper() == "TRIAL":
-        row = upsert_trial_license("TRIAL", machine_id)
-    else:
-        row = get_license_by_key(license_key)
-        if row is None:
+        # -----------------------------------------------------------
+        # 1) product チェック
+        # -----------------------------------------------------------
+        if raw_product != "GeoTivity":
             log_verification(
                 conn,
                 license_id=None,
-                license_key=license_key,
-                machine_id=machine_id,
-                product=req.product,
-                version=req.version,
-                client_time=req.client_time,
+                license_key=raw_license_key,
+                machine_id=raw_machine_id,
+                product=raw_product,
+                version=raw_version,
+                client_time=raw_client_time,
                 success=False,
-                error_code="LICENSE_NOT_FOUND",
-                message="License key not found.",
+                error_code="INVALID_PRODUCT",
+                message="Invalid product.",
                 remote_addr=remote_addr,
             )
             conn.commit()
             return {
                 "ok": False,
-                "error_code": "LICENSE_NOT_FOUND",
-                "message": "License key not found.",
+                "error_code": "INVALID_PRODUCT",
+                "message": "Invalid product.",
             }
 
-    license_id = int(row["id"])
-    row_status = str(row["status"])
-    row_type = str(row["license_type"])
-    issued_at = str(row["issued_at"])
-    expires_at = str(row["expires_at"])
-    area_limit_ha = float(row["area_limit_ha"] or 0.0)
-    bound_machine_id = (row["machine_id"] or "").strip()
+        license_key = raw_license_key.strip()
+        machine_id = normalize_machine_id(raw_machine_id)
 
-    today = datetime.utcnow().date()
-    try:
-        expires_date = datetime.strptime(expires_at, "%Y-%m-%d").date()
-    except Exception:
-        log_verification(
-            conn,
-            license_id=license_id,
-            license_key=license_key,
-            machine_id=machine_id,
-            product=req.product,
-            version=req.version,
-            client_time=req.client_time,
-            success=False,
-            error_code="INVALID_EXPIRES_AT",
-            message="Invalid expires_at on server.",
-            remote_addr=remote_addr,
-        )
-        conn.commit()
-        return {
-            "ok": False,
-            "error_code": "INVALID_EXPIRES_AT",
-            "message": "Invalid expires_at on server.",
-        }
-        
-    if today > expires_date:
-        with db_connect() as conn:
-            conn.execute(
-                """
-                UPDATE licenses
-                SET status = ?, updated_at = ?
-                WHERE license_key = ?
-                """,
-                ("expired", today_utc_str(), license_key),
+        # -----------------------------------------------------------
+        # 2) 入力値チェック (license_key / machine_id)
+        # -----------------------------------------------------------
+        if not license_key:
+            log_verification(
+                conn,
+                license_id=None,
+                license_key=raw_license_key,
+                machine_id=raw_machine_id,
+                product=raw_product,
+                version=raw_version,
+                client_time=raw_client_time,
+                success=False,
+                error_code="EMPTY_LICENSE_KEY",
+                message="License key is empty.",
+                remote_addr=remote_addr,
             )
             conn.commit()
+            return {
+                "ok": False,
+                "error_code": "EMPTY_LICENSE_KEY",
+                "message": "License key is empty.",
+            }
 
-        log_verification(
-            conn,
-            license_id=license_id,
-            license_key=license_key,
-            machine_id=machine_id,
-            product=req.product,
-            version=req.version,
-            client_time=req.client_time,
-            success=False,
-            error_code="LICENSE_EXPIRED",
-            message="License expired.",
-            remote_addr=remote_addr,
-        )
-        conn.commit()
-        return {
-            "ok": False,
-            "error_code": "LICENSE_EXPIRED",
-            "message": "License expired.",
-        }
-
-    if row_status != "active":
-        log_verification(
-            conn,
-            license_id=license_id,
-            license_key=license_key,
-            machine_id=machine_id,
-            product=req.product,
-            version=req.version,
-            client_time=req.client_time,
-            success=False,
-            error_code="LICENSE_INACTIVE",
-            message="License is inactive.",
-            remote_addr=remote_addr,
-        )
-        conn.commit()
-        return {
-            "ok": False,
-            "error_code": "LICENSE_INACTIVE",
-            "message": "License is inactive.",
-        }
-
-    if row_type == "trial":
-        # trial は初回アクセスの machine_id で固定
-        if not bound_machine_id:
-            conn.execute(
-                """
-                UPDATE licenses
-                SET machine_id = ?, updated_at = ?
-                WHERE license_key = ?
-                """,
-                (machine_id, now, license_key),
+        if not machine_id:
+            log_verification(
+                conn,
+                license_id=None,
+                license_key=license_key,
+                machine_id=raw_machine_id,
+                product=raw_product,
+                version=raw_version,
+                client_time=raw_client_time,
+                success=False,
+                error_code="EMPTY_MACHINE_ID",
+                message="Machine ID is empty.",
+                remote_addr=remote_addr,
             )
             conn.commit()
-            bound_machine_id = machine_id
+            return {
+                "ok": False,
+                "error_code": "EMPTY_MACHINE_ID",
+                "message": "Machine ID is empty.",
+            }
 
-        if bound_machine_id != machine_id:
+        # -----------------------------------------------------------
+        # 3) ライセンス取得
+        # -----------------------------------------------------------
+        if license_key.upper() == "TRIAL":
+            row = upsert_trial_license("TRIAL", machine_id)
+        else:
+            row = get_license_by_key(license_key)
+            if row is None:
+                log_verification(
+                    conn,
+                    license_id=None,
+                    license_key=license_key,
+                    machine_id=machine_id,
+                    product=raw_product,
+                    version=raw_version,
+                    client_time=raw_client_time,
+                    success=False,
+                    error_code="LICENSE_NOT_FOUND",
+                    message="License key not found.",
+                    remote_addr=remote_addr,
+                )
+                conn.commit()
+                return {
+                    "ok": False,
+                    "error_code": "LICENSE_NOT_FOUND",
+                    "message": "License key not found.",
+                }
+
+        # -----------------------------------------------------------
+        # 4) DB レコードからライセンス状態を取得 (NULL 安全)
+        #    - expires_at: NULL/空 -> 期限なし (perpetual)
+        #    - area_limit_ha: NULL -> 0.0 フォールバック
+        # -----------------------------------------------------------
+        license_id = int(row["id"])
+        row_status = str(row["status"] or "")
+        row_type = str(row["license_type"] or "")
+        issued_at = str(row["issued_at"] or "")
+
+        raw_expires_at = row["expires_at"]
+        expires_at_str = (
+            str(raw_expires_at).strip() if raw_expires_at is not None else ""
+        )
+        # "None"/"null" 文字列の異常値ガード
+        if expires_at_str.lower() in ("none", "null"):
+            expires_at_str = ""
+
+        expires_date = None
+        if expires_at_str:
+            try:
+                expires_date = datetime.strptime(
+                    expires_at_str, "%Y-%m-%d"
+                ).date()
+            except Exception:
+                logger.warning(
+                    "verify_license: invalid expires_at in DB "
+                    "license_key=%s value=%r",
+                    license_key,
+                    raw_expires_at,
+                )
+                log_verification(
+                    conn,
+                    license_id=license_id,
+                    license_key=license_key,
+                    machine_id=machine_id,
+                    product=raw_product,
+                    version=raw_version,
+                    client_time=raw_client_time,
+                    success=False,
+                    error_code="INVALID_EXPIRES_AT",
+                    message="Invalid expires_at on server.",
+                    remote_addr=remote_addr,
+                )
+                conn.commit()
+                return {
+                    "ok": False,
+                    "error_code": "INVALID_EXPIRES_AT",
+                    "message": "Invalid expires_at on server.",
+                }
+
+        raw_area = row["area_limit_ha"]
+        try:
+            area_limit_ha = float(raw_area) if raw_area is not None else 0.0
+        except (TypeError, ValueError):
+            area_limit_ha = 0.0
+
+        bound_machine_id = str(row["machine_id"] or "").strip()
+        today = datetime.utcnow().date()
+
+        # -----------------------------------------------------------
+        # 5) 期限切れ判定 (expires_at が NULL のときはスキップ)
+        # -----------------------------------------------------------
+        if expires_date is not None and today > expires_date:
+            with db_connect() as expire_conn:
+                expire_conn.execute(
+                    """
+                    UPDATE licenses
+                    SET status = ?, updated_at = ?
+                    WHERE license_key = ?
+                    """,
+                    ("expired", today_utc_str(), license_key),
+                )
+                expire_conn.commit()
+
             log_verification(
                 conn,
                 license_id=license_id,
                 license_key=license_key,
                 machine_id=machine_id,
-                product=req.product,
-                version=req.version,
-                client_time=req.client_time,
+                product=raw_product,
+                version=raw_version,
+                client_time=raw_client_time,
                 success=False,
-                error_code="MACHINE_MISMATCH",
-                message="License machine mismatch.",
+                error_code="LICENSE_EXPIRED",
+                message="License expired.",
                 remote_addr=remote_addr,
             )
             conn.commit()
             return {
                 "ok": False,
-                "error_code": "MACHINE_MISMATCH",
-                "message": "License machine mismatch.",
+                "error_code": "LICENSE_EXPIRED",
+                "message": "License expired.",
             }
 
-    else:
-        max_machines = int(row["max_machines"] or 1)
+        # -----------------------------------------------------------
+        # 6) status チェック
+        # -----------------------------------------------------------
+        if row_status != "active":
+            log_verification(
+                conn,
+                license_id=license_id,
+                license_key=license_key,
+                machine_id=machine_id,
+                product=raw_product,
+                version=raw_version,
+                client_time=raw_client_time,
+                success=False,
+                error_code="LICENSE_INACTIVE",
+                message="License is inactive.",
+                remote_addr=remote_addr,
+            )
+            conn.commit()
+            return {
+                "ok": False,
+                "error_code": "LICENSE_INACTIVE",
+                "message": "License is inactive.",
+            }
 
-        existing_machine = conn.execute(
-            """
-            SELECT id
-            FROM machines
-            WHERE license_id = ? AND machine_id = ? AND is_active = 1
-            """,
-            (license_id, machine_id),
-        ).fetchone()
+        # -----------------------------------------------------------
+        # 7) trial / full で machine バインドを検証
+        # -----------------------------------------------------------
+        if row_type == "trial":
+            # trial は初回アクセスの machine_id で固定
+            if not bound_machine_id:
+                conn.execute(
+                    """
+                    UPDATE licenses
+                    SET machine_id = ?, updated_at = ?
+                    WHERE license_key = ?
+                    """,
+                    (machine_id, now, license_key),
+                )
+                conn.commit()
+                bound_machine_id = machine_id
+
+            if bound_machine_id != machine_id:
+                log_verification(
+                    conn,
+                    license_id=license_id,
+                    license_key=license_key,
+                    machine_id=machine_id,
+                    product=raw_product,
+                    version=raw_version,
+                    client_time=raw_client_time,
+                    success=False,
+                    error_code="MACHINE_MISMATCH",
+                    message="License machine mismatch.",
+                    remote_addr=remote_addr,
+                )
+                conn.commit()
+                return {
+                    "ok": False,
+                    "error_code": "MACHINE_MISMATCH",
+                    "message": "License machine mismatch.",
+                }
+
+        else:
+            max_machines = int(row["max_machines"] or 1)
+
+            existing_machine = conn.execute(
+                """
+                SELECT id
+                FROM machines
+                WHERE license_id = ? AND machine_id = ? AND is_active = 1
+                """,
+                (license_id, machine_id),
+            ).fetchone()
+
+            active_count_row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM machines
+                WHERE license_id = ? AND is_active = 1
+                """,
+                (license_id,),
+            ).fetchone()
+
+            active_count = int(active_count_row[0] or 0)
+
+            if existing_machine is None and active_count >= max_machines:
+                log_verification(
+                    conn,
+                    license_id=license_id,
+                    license_key=license_key,
+                    machine_id=machine_id,
+                    product=raw_product,
+                    version=raw_version,
+                    client_time=raw_client_time,
+                    success=False,
+                    error_code="MAX_MACHINES_REACHED",
+                    message="maximum active machines reached",
+                    remote_addr=remote_addr,
+                )
+                conn.commit()
+                return {
+                    "ok": False,
+                    "error_code": "MAX_MACHINES_REACHED",
+                    "message": "Maximum active machines reached.",
+                }
+
+        # -----------------------------------------------------------
+        # 8) verify 成功 → タイムスタンプ / machine binding 更新
+        # -----------------------------------------------------------
+        update_license_verify_timestamps(
+            conn,
+            license_id=license_id,
+            license_type=row_type,
+            expires_at=expires_at_str or None,
+        )
+
+        upsert_machine_binding(
+            conn,
+            license_id=license_id,
+            machine_id=machine_id,
+            product_version=raw_version,
+        )
 
         active_count_row = conn.execute(
             """
@@ -1640,97 +1765,115 @@ def verify_license(req: VerifyRequest, request: Request):
 
         active_count = int(active_count_row[0] or 0)
 
-        if existing_machine is None and active_count >= max_machines:
-            log_verification(
-                conn,
-                license_id=license_id,
-                license_key=license_key,
-                machine_id=machine_id,
-                product=req.product,
-                version=req.version,
-                client_time=req.client_time,
-                success=False,
-                error_code="MAX_MACHINES_REACHED",
-                message="maximum active machines reached",
-                remote_addr=remote_addr,
-            )
-            conn.commit()
-            return {
-                "ok": False,
-                "error_code": "MAX_MACHINES_REACHED",
-                "message": "Maximum active machines reached.",
-            }
+        conn.execute(
+            """
+            UPDATE licenses
+            SET current_machine_count = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (active_count, today_utc_str(), license_id),
+        )
 
-    update_license_verify_timestamps(
-        conn,
-        license_id=license_id,
-        license_type=row_type,
-        expires_at=expires_at,
-    )
+        log_verification(
+            conn,
+            license_id=license_id,
+            license_key=license_key,
+            machine_id=machine_id,
+            product=raw_product,
+            version=raw_version,
+            client_time=raw_client_time,
+            success=True,
+            error_code="",
+            message="ok",
+            remote_addr=remote_addr,
+        )
 
-    upsert_machine_binding(
-        conn,
-        license_id=license_id,
-        machine_id=machine_id,
-        product_version=req.version,
-    )
+        conn.commit()
 
-    active_count_row = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM machines
-        WHERE license_id = ? AND is_active = 1
-        """,
-        (license_id,),
-    ).fetchone()
+        # -----------------------------------------------------------
+        # 9) レスポンス組み立て
+        # -----------------------------------------------------------
+        support_enabled = int(row["support_enabled"] or 0)
+        support_until = str(row["support_until"] or "")
+        support_active = is_support_active(row)
 
-    active_count = int(active_count_row[0] or 0)
+        response_state = make_response_state(
+            license_key=license_key,
+            license_type=row_type,
+            status="active",
+            issued_at=issued_at,
+            expires_at=expires_at_str,  # "" = 期限なし
+            area_limit_ha=area_limit_ha,
+            machine_id=machine_id,
+            support_enabled=support_enabled,
+            support_until=support_until,
+            support_active=support_active,
+        )
 
-    conn.execute(
-        """
-        UPDATE licenses
-        SET current_machine_count = ?,
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (active_count, today_utc_str(), license_id),
-    )
+        response_state["ok"] = True
+        # expires_at 空 = 無期限であることをクライアントに伝える
+        if not expires_at_str:
+            response_state["expires_at"] = ""
+            response_state["is_perpetual"] = True
+        else:
+            response_state["is_perpetual"] = bool(int(row["is_perpetual"] or 0))
 
-    log_verification(
-        conn,
-        license_id=license_id,
-        license_key=license_key,
-        machine_id=machine_id,
-        product=req.product,
-        version=req.version,
-        client_time=req.client_time,
-        success=True,
-        error_code="",
-        message="ok",
-        remote_addr=remote_addr,
-    )
+        return response_state
 
-    conn.commit()
+    except HTTPException:
+        # Pydantic / 手動 raise の HTTPException はそのまま伝搬
+        raise
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error("verify_license internal error: %s", exc)
+        logger.error("verify_license traceback:\n%s", tb)
+        # traceback を stdout にも出しておく (Render のログで追いやすくする)
+        print(
+            "[verify_license] INTERNAL_ERROR: "
+            f"{type(exc).__name__}: {exc}\n{tb}",
+            flush=True,
+        )
 
-    support_enabled = int(row["support_enabled"] or 0)
-    support_until = str(row["support_until"] or "")
-    support_active = is_support_active(row)
+        # 可能なら verification ログにも失敗として残す
+        if conn is not None:
+            try:
+                log_verification(
+                    conn,
+                    license_id=None,
+                    license_key=raw_license_key,
+                    machine_id=raw_machine_id,
+                    product=raw_product,
+                    version=raw_version,
+                    client_time=raw_client_time,
+                    success=False,
+                    error_code="INTERNAL_ERROR",
+                    message=(
+                        f"verify_license internal error: "
+                        f"{type(exc).__name__}: {exc}"
+                    )[:500],
+                    remote_addr=remote_addr,
+                )
+                conn.commit()
+            except Exception as log_exc:
+                logger.error(
+                    "verify_license: failed to write failure log: %s",
+                    log_exc,
+                )
 
-    response_state = make_response_state(
-        license_key=license_key,
-        license_type=row_type,
-        status="active",
-        issued_at=issued_at,
-        expires_at=expires_at,
-        area_limit_ha=area_limit_ha,
-        machine_id=machine_id,
-        support_enabled=support_enabled,
-        support_until=support_until,
-        support_active=support_active,
-    )
-
-    response_state["ok"] = True
-    return response_state
+        # 500 を直接返さず JSON 形式の失敗レスポンスにする
+        return {
+            "ok": False,
+            "error_code": "INTERNAL_ERROR",
+            "message": "Internal verify error. See server logs.",
+            "error_type": type(exc).__name__,
+        }
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 # =========================
